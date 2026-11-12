@@ -2,33 +2,31 @@ import sys
 
 try:
     import numpy as np
-except Exception:  # judge without numpy: reduced (single-pass) decoder
+except Exception:
     np = None
 
 N = 5940
-T = 88            # samples per symbol
-NL = 6            # symbols carrying (length - 1)
+T = 88
+NL = 6
 MAXB = 55
-PILOT = [1.0, 1.0, -1.0, 1.0, -1.0, -1.0]  # known symbols, used to identify the channel
+PILOT = [1.0, 1.0, -1.0, 1.0, -1.0, -1.0]
 NP = len(PILOT)
 NS = NP + NL + MAXB
-AP, AQ = 10, 16   # orders of the recursive channel model
+AP, AQ = 10, 16
 MID = 2048
-LF = 300          # taps of the channel correction estimated from the recording
+LF = 300
 
-# Candidate symbol shapes; the baseline run decides which one the channel carries best.
 PATS = [
     [1.0] * 44 + [-1.0] * 44,
     [1.0] * 22 + [-1.0] * 44 + [1.0] * 22,
     [1.0] * 88,
 ]
 
-H = None          # channel knowledge from mode 3
-KNOWN_LEN = None  # message length seen in mode 1 (all messages of a test share it)
+H = None
+KNOWN_LEN = None
 
 
 def conv(a, b):
-    """First N samples of a convolved with the short sequence b."""
     if np is not None:
         return np.convolve(np.asarray(a, float), np.asarray(b, float))[:N]
     out = [0.0] * N
@@ -52,34 +50,14 @@ def lstsq(cols, y):
     if np is not None:
         return np.linalg.lstsq(np.column_stack(cols), y, rcond=None)[0]
     m = len(cols)
-    a = [[0.0] * (m + 1) for _ in range(m)]
+    a = [[0.0] * m for _ in range(m)]
+    b = [0.0] * m
     for i in range(m):
-        ci = cols[i]
         for j in range(i, m):
-            cj = cols[j]
-            v = 0.0
-            for p, q in zip(ci, cj):
-                v += p * q
-            a[i][j] = a[j][i] = v
-        v = 0.0
-        for p, q in zip(ci, y):
-            v += p * q
-        a[i][m] = v
-    for i in range(m):
-        a[i][i] *= 1.0 + 1e-9
-    for i in range(m):
-        p = max(range(i, m), key=lambda r: abs(a[r][i]))
-        a[i], a[p] = a[p], a[i]
-        d = a[i][i]
-        if abs(d) < 1e-12:
-            continue
-        for r in range(m):
-            if r != i and a[r][i] != 0.0:
-                f = a[r][i] / d
-                ar, ai = a[r], a[i]
-                for c in range(i, m + 1):
-                    ar[c] -= f * ai[c]
-    return [a[i][m] / a[i][i] if abs(a[i][i]) > 1e-12 else 0.0 for i in range(m)]
+            a[i][j] = a[j][i] = sum(p * q for p, q in zip(cols[i], cols[j]))
+        b[i] = sum(p * q for p, q in zip(cols[i], y))
+        a[i][i] = a[i][i] * (1.0 + 1e-9) + 1e-12
+    return gauss(a, b)
 
 
 def symbols_for(msg):
@@ -94,7 +72,6 @@ def symbols_for(msg):
 
 
 def predicted_peak(g, s):
-    """Peak sensor deviation predicted for symbols s, per unit of drive amplitude."""
     if np is not None:
         tot = np.zeros(N)
         for k, sk in enumerate(s):
@@ -125,7 +102,6 @@ def baseline(h):
         limit = max(0.85 * min(base, 4095 - base), peak)
     else:
         limit = 3.0 * peak
-    # fixed pseudo-random symbols, so encoder and decoder agree on the shape
     seed, prs = 12345, []
     for _ in range(NS):
         seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
@@ -173,7 +149,6 @@ def encode(msg):
 
 
 def sym_ls(heff, y, pat, use_step=True):
-    """Least-squares symbol amplitudes for channel response heff; returns (residual, amplitudes)."""
     g = conv(heff, pat)
     if np is not None:
         cols = [np.ones(N)]
@@ -185,8 +160,6 @@ def sym_ls(heff, y, pat, use_step=True):
         w = np.linalg.lstsq(a / sc, y, rcond=None)[0]
         r = y - (a / sc) @ w
         return float(r @ r), list((w / sc)[-NS:])
-    # pure Python: the symbol columns are shifts of g, so their Gram matrix comes from
-    # prefix sums of lagged products
     ne = 2 if use_step else 1
     m = ne + NS
     gm = [[0.0] * m for _ in range(m)]
@@ -259,10 +232,6 @@ def ar_filter(v, ar):
 
 
 def arx_fit(x, y, t1):
-    """Fit y[t] = sum a_i y[t-i] + sum b_j x[t-j] + c on samples before t1.
-
-    Returns impulse responses of the plain fit and of its Steiglitz-McBride refinements
-    (which remove the bias that sensor noise puts on the plain fit)."""
     t0 = max(AP, AQ)
     if t1 - t0 < 3 * (AP + AQ):
         return []
@@ -298,7 +267,6 @@ def arx_fit(x, y, t1):
 
 
 def fir_fit(x, y):
-    """Baseline response plus a short FIR correction, fitted to the recording (numpy only)."""
     cols = [np.ones(N)]
     if H:
         cols += [H['step'], np.convolve(H['ht'], x)[:N]]
