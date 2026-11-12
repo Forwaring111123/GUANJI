@@ -1,362 +1,451 @@
 import sys
+from itertools import accumulate
+from math import acos, pi, sin, sqrt
+from operator import mul
 
 try:
-    import numpy as np
-except Exception:
-    np = None
+    from math import sumprod
+except ImportError:
+    def sumprod(a, b):
+        return sum(map(mul, a, b))
 
 N = 5940
-T = 88
-NL = 6
-MAXB = 55
-PILOT = [1.0, 1.0, -1.0, 1.0, -1.0, -1.0]
+T = 80
+NF = 11
+NB = 55
+PILOT = [1.0, 1.0, 1.0, -1.0, -1.0, 1.0, -1.0]
 NP = len(PILOT)
-NS = NP + NL + MAXB
-AP, AQ = 10, 16
-MID = 2048
-LF = 300
-
-PATS = [
-    [1.0] * 44 + [-1.0] * 44,
-    [1.0] * 22 + [-1.0] * 44 + [1.0] * 22,
-    [1.0] * 88,
-]
-
-H = None
-KNOWN_LEN = None
+NS = NP + NF + NB
+STAGES = ((NP, 4, 14), (14, 5, 28), (28, 7, 56), (56, 10, NS))
+TAPS = 12
+PARITY = [0b11100, 0b11010, 0b11001, 0b10110, 0b10101, 0b10011]
 
 
-def conv(a, b):
-    if np is not None:
-        return np.convolve(np.asarray(a, float), np.asarray(b, float))[:N]
-    out = [0.0] * N
-    for j, bj in enumerate(b):
-        if bj == 0.0:
-            continue
-        for i in range(min(len(a), N - j)):
-            out[i + j] += a[i] * bj
+def prbs(count, seed):
+    out = []
+    state = seed
+    for _ in range(count):
+        state = (state * 1103515245 + 12345) & 0x7FFFFFFF
+        out.append(1.0 if (state >> 16) & 1 else -1.0)
     return out
 
 
-def shift(g, d):
-    if np is not None:
-        r = np.zeros(N)
-        r[d:] = g[:N - d]
-        return r
-    return [0.0] * d + list(g[:N - d])
+def field_code(length):
+    value = length - 1
+    bits = [(value >> (5 - i)) & 1 for i in range(6)]
+    parity = 0
+    for i in range(6):
+        if bits[i]:
+            parity ^= PARITY[i]
+    bits += [(parity >> (4 - i)) & 1 for i in range(5)]
+    return [1.0 if b else -1.0 for b in bits]
 
 
-def lstsq(cols, y):
-    if np is not None:
-        return np.linalg.lstsq(np.column_stack(cols), y, rcond=None)[0]
-    m = len(cols)
-    a = [[0.0] * m for _ in range(m)]
-    b = [0.0] * m
-    for i in range(m):
-        for j in range(i, m):
-            a[i][j] = a[j][i] = sum(p * q for p, q in zip(cols[i], cols[j]))
-        b[i] = sum(p * q for p, q in zip(cols[i], y))
-        a[i][i] = a[i][i] * (1.0 + 1e-9) + 1e-12
-    return gauss(a, b)
+SCR_F = prbs(NF, 11)
+SCR_B = prbs(NB, 23)
+CODES = [field_code(length) for length in range(1, NB + 1)]
+
+SHAPER = [(0, 1.0)]
+DRIVE = [2048.0, 1024.0, False]
+MODEL = None
+FIELD_ACC = [0.0] * NF
 
 
-def symbols_for(msg):
-    s = [0.0] * NS
-    s[:NP] = PILOT
-    v = len(msg) - 1
-    for i in range(NL):
-        s[NP + i] = 1.0 if (v >> (NL - 1 - i)) & 1 else -1.0
-    for i, ch in enumerate(msg):
-        s[NP + NL + i] = 1.0 if ch == '1' else -1.0
-    return s
+def frame_symbols(bits):
+    length = len(bits)
+    code = CODES[length - 1]
+    field = [code[i] * SCR_F[i] for i in range(NF)]
+    payload = [(1.0 if bits[j % length] == '1' else -1.0) * SCR_B[j] for j in range(NB)]
+    return PILOT + field + payload
 
 
-def predicted_peak(g, s):
-    if np is not None:
-        tot = np.zeros(N)
-        for k, sk in enumerate(s):
-            if sk:
-                tot[k * T:] += sk * g[:N - k * T]
-        return float(np.max(np.abs(tot)))
-    tot = [0.0] * N
-    for k, sk in enumerate(s):
-        if sk:
-            o = k * T
-            for i in range(N - o):
-                tot[o + i] += sk * g[i]
-    return max(abs(v) for v in tot)
+def apply_fir(x, taps, pad):
+    out = [0.0] * len(x)
+    for delay, weight in taps:
+        out = [o + weight * v for o, v in zip(out, [pad] * delay + x)]
+    return out
 
 
-def baseline(h):
-    global H
-    H = None
-    if len(h) < 100:
+def find_mode(dev):
+    peak = max(map(abs, dev))
+    strong = [i for i, x in enumerate(dev) if abs(x) > 0.25 * peak]
+    lo, hi = strong[0], strong[-1]
+    hyst = 0.08 * peak
+    lobes = []
+    for i in range(lo, hi + 1):
+        x = dev[i]
+        if abs(x) <= hyst:
+            continue
+        if lobes and lobes[-1][0] == (x > 0):
+            lobes[-1][2] = i
+            lobes[-1][3] = max(lobes[-1][3], abs(x))
+        else:
+            lobes.append([x > 0, i, i, abs(x)])
+    if len(lobes) < 4:
+        return None
+    crossings = []
+    for a, b in zip(lobes, lobes[1:]):
+        i, j = a[2], b[1]
+        crossings.append(i + (j - i) * abs(dev[i]) / (abs(dev[i]) + abs(dev[j])))
+    half = (crossings[-1] - crossings[0]) / (len(crossings) - 1)
+    ratios = sorted(b[3] / a[3] for a, b in zip(lobes[1:], lobes[2:]))
+    theta = pi / half
+    radius = min(1.0, ratios[len(ratios) // 2]) ** (1.0 / half)
+    d = max(1, int(round(half / 2.0)))
+    x0 = dev[lo + 2 * d:hi + 1]
+    x1 = dev[lo + d:hi + 1 - d]
+    x2 = dev[lo:hi + 1 - 2 * d]
+    if len(x0) > 8:
+        s11, s12, s22 = sumprod(x1, x1), sumprod(x1, x2), sumprod(x2, x2)
+        b1, b2 = sumprod(x0, x1), sumprod(x0, x2)
+        det = s11 * s22 - s12 * s12
+        if det > 0.0:
+            a1 = (b1 * s22 - b2 * s12) / det
+            a2 = (b2 * s11 - b1 * s12) / det
+            if a2 < 0.0 and abs(a1) < 2.0 * sqrt(-a2):
+                fine = acos(a1 / (2.0 * sqrt(-a2))) / d
+                if abs(fine - theta) < 0.2 * theta:
+                    theta = fine
+                    radius = min(1.0, sqrt(-a2) ** (1.0 / d))
+    return theta, radius
+
+
+def shaper_taps(theta, radius):
+    n1 = int(pi / theta)
+    n2 = n1 + 1
+    k1 = -radius ** n1 * sin(theta * n2) / sin(theta)
+    k2 = radius ** n2 * sin(theta * n1) / sin(theta)
+    gain = 1.0 + k1 + k2
+    return [(d, w / gain) for d, w in ((0, 1.0), (n1, k1), (n2, k2)) if w > 1e-9]
+
+
+def analyse_baseline(h):
+    n = len(h)
+    if n < 200:
         return
-    tail = sorted(h[-(len(h) // 5):])
-    base = tail[len(tail) // 2]
-    ht = [float(v) - base for v in h[:N]] + [0.0] * max(0, N - len(h))
-    peak = max(abs(v) for v in ht)
-    if peak < 3:
+    tail = h[-(n // 5):]
+    base = sum(tail) / len(tail)
+    dev = [v - base for v in h[:N]]
+    peak = max(map(abs, dev))
+    if peak < 4.0:
+        return
+    mode = find_mode(dev)
+    if mode is not None and 2.0 * pi / (2 * T) <= mode[0] < 2.8:
+        SHAPER[:] = shaper_taps(*mode)
+    floor = max(0.05 * peak, 1.5)
+    last = max(i for i, v in enumerate(dev) if abs(v) > floor)
+    span = min(len(dev), last + 20)
+    step = list(accumulate(dev[:span]))
+    step += [step[-1]] * (N - span)
+    smax = max(map(abs, step))
+    szmax = max(map(abs, apply_fir(step, SHAPER, 0.0)))
+    cmax = 0.0
+    for trial in range(2):
+        syms = PILOT + prbs(NS - NP, 99 + trial) + [0.0]
+        total = [0.0] * N
+        prev = 0.0
+        for k, s in enumerate(syms):
+            if s != prev:
+                off = T + k * T
+                jump = s - prev
+                total[off:] = [p + jump * q for p, q in zip(total[off:], step)]
+                prev = s
+        total = apply_fir(total, SHAPER, 0.0)
+        cmax = max(cmax, max(total), -min(total))
+    if cmax <= 0.0:
         return
     if min(h) >= 0 and max(h) <= 4095:
-        limit = max(0.85 * min(base, 4095 - base), peak)
+        room = min(base, 4095.0 - base)
+        target = 0.5 * room
+        ceiling = 0.9 * room
     else:
-        limit = 3.0 * peak
-    seed, prs = 12345, []
-    for _ in range(NS):
-        seed = (seed * 1103515245 + 12345) & 0x7FFFFFFF
-        prs.append(1.0 if (seed >> 16) & 1 else -1.0)
-    best = None
-    for ci, pat in enumerate(PATS):
-        g = conv(ht, pat)
-        if np is not None:
-            g = g / 2047.0
-            en = float(np.dot(g, g))
-        else:
-            g = [v / 2047.0 for v in g]
-            en = sum(v * v for v in g)
-        amp = min(2047.0, limit / max(predicted_peak(g, prs), 1e-9))
-        score = amp * amp * en
-        if best is None or score > best[0]:
-            best = (score, ci, g)
-    step, acc = [], 0.0
-    for v in ht:
-        acc += v
-        step.append(acc)
-    if np is not None:
-        ht, step = np.array(ht), np.array(step)
-    H = {'ht': ht, 'cand': best[1], 'g': best[2], 'limit': limit, 'step': step}
-
-
-def encode(msg):
-    global KNOWN_LEN
-    msg = ''.join(c for c in msg if c in '01')[:MAXB] or '0'
-    KNOWN_LEN = len(msg)
-    s = symbols_for(msg)
-    if H is None:
-        pat, amp = PATS[0], 1000.0
+        target = 2.0 * peak
+        ceiling = 4.0 * peak
+    target = max(target, 0.5 * peak)
+    ceiling = max(ceiling, target)
+    best = (0.0, 2048.0)
+    for index in range(64, -1, -1):
+        center = 32.0 * index
+        amp = min(
+            (ceiling * 4095.0 - center * smax) / (1.25 * cmax),
+            (ceiling * 2047.0 - (2048.0 - center) * smax) / (1.25 * cmax),
+            target * 2047.0 / (1.25 * cmax),
+            center,
+            4095.0 - center,
+        )
+        if amp > best[0]:
+            best = (amp, center)
+    if best[0] >= 48.0:
+        DRIVE[:] = [best[1], best[0], False]
     else:
-        pat = PATS[H['cand']]
-        amp = min(2047.0, H['limit'] / max(predicted_peak(H['g'], s), 1e-9))
-        amp = max(amp, 64.0)
-    out = [MID] * N
-    for k, sk in enumerate(s):
-        if sk:
-            o = k * T
-            for i, p in enumerate(pat):
-                out[o + i] = min(4095, max(0, int(round(MID + amp * sk * p))))
-    return out
+        amp = max(48.0, min(2047.0, target * 4095.0 / (szmax + 1.25 * cmax)))
+        DRIVE[:] = [amp, amp, True]
 
 
-def sym_ls(heff, y, pat, use_step=True):
-    g = conv(heff, pat)
-    if np is not None:
-        cols = [np.ones(N)]
-        if use_step:
-            cols.append(np.cumsum(np.asarray(heff, float))[:N])
-        cols += [shift(g, k * T) for k in range(NS)]
-        a = np.column_stack(cols)
-        sc = np.sqrt((a * a).sum(axis=0)) + 1e-12
-        w = np.linalg.lstsq(a / sc, y, rcond=None)[0]
-        r = y - (a / sc) @ w
-        return float(r @ r), list((w / sc)[-NS:])
-    ne = 2 if use_step else 1
-    m = ne + NS
-    gm = [[0.0] * m for _ in range(m)]
-    rhs = [0.0] * m
-    ext = [[1.0] * N]
-    if use_step:
-        st, acc = [], 0.0
-        for v in list(heff)[:N] + [0.0] * (N - len(heff)):
-            acc += v
-            st.append(acc)
-        ext.append(st)
-    for i in range(ne):
-        for j in range(i, ne):
-            gm[i][j] = gm[j][i] = sum(p * q for p, q in zip(ext[i], ext[j]))
-        rhs[i] = sum(p * q for p, q in zip(ext[i], y))
-        for k in range(NS):
-            v = sum(p * q for p, q in zip(ext[i][k * T:], g))
-            gm[i][ne + k] = gm[ne + k][i] = v
-    for k in range(NS):
-        rhs[ne + k] = sum(p * q for p, q in zip(y[k * T:], g))
-    for lag in range(NS):
-        pre, acc = [0.0], 0.0
-        for p, q in zip(g[lag * T:], g):
-            acc += p * q
-            pre.append(acc)
-        for j in range(lag, NS):
-            n = N - j * T
-            v = pre[min(n, len(pre) - 1)]
-            gm[ne + j - lag][ne + j] = gm[ne + j][ne + j - lag] = v
-    for i in range(m):
-        gm[i][i] = gm[i][i] * (1.0 + 1e-9) + 1e-12
-    w = gauss(gm, rhs)
-    res = sum(v * v for v in y) - sum(p * q for p, q in zip(w, rhs))
-    return res, w[-NS:]
+def encode(message):
+    bits = ''.join(ch for ch in message if ch in '01')[:NB] or '0'
+    center, amp, shaped_onset = DRIVE
+    levels = [0.0] * N
+    for k, s in enumerate(frame_symbols(bits)):
+        levels[T + k * T:T + (k + 1) * T] = [s] * T
+    if shaped_onset:
+        wave = apply_fir([center + amp * x for x in levels], SHAPER, 0.0)
+    else:
+        wave = [center + amp * x for x in apply_fir(levels, SHAPER, 0.0)]
+    return [min(4095, max(0, int(round(x)))) for x in wave]
 
 
-def gauss(a, b):
-    m = len(b)
-    a = [row[:] + [b[i]] for i, row in enumerate(a)]
-    for i in range(m):
-        p = max(range(i, m), key=lambda r: abs(a[r][i]))
-        a[i], a[p] = a[p], a[i]
-        d = a[i][i]
-        if abs(d) < 1e-300:
+def cholesky(m):
+    for ridge in (1e-9, 1e-7, 1e-5, 1e-3):
+        low = []
+        for i in range(len(m)):
+            row = m[i]
+            cur = [0.0] * (i + 1)
+            for j in range(i):
+                prev = low[j]
+                cur[j] = (row[j] - sumprod(cur[:j], prev[:j])) / prev[j]
+            d = row[i] * (1.0 + ridge) + ridge - sumprod(cur[:i], cur[:i])
+            if not d > 0.0:
+                low = None
+                break
+            cur[i] = sqrt(d)
+            low.append(cur)
+        if low is not None:
+            return low
+    return None
+
+
+def chol_solve(low, b):
+    n = len(b)
+    z = [0.0] * n
+    for i in range(n):
+        row = low[i]
+        z[i] = (b[i] - sumprod(row[:i], z[:i])) / row[i]
+    x = [0.0] * n
+    for i in range(n - 1, -1, -1):
+        acc = z[i]
+        for k in range(i + 1, n):
+            acc -= low[k][i] * x[k]
+        x[i] = acc / low[i][i]
+    return x
+
+
+def estimate(v, sym, known, count, taps):
+    size = taps + 1
+    q = [[0.0] * size for _ in range(size)]
+    acc = [[0.0] * T for _ in range(size)]
+    used = 0
+    for n in range(1, count + 1):
+        first = max(0, n - taps)
+        if not all(known[first:n]):
             continue
-        ai = a[i]
-        for r in range(i + 1, m):
-            f = a[r][i] / d
-            if f:
-                ar = a[r]
-                for c in range(i, m + 1):
-                    ar[c] -= f * ai[c]
-    w = [0.0] * m
-    for i in range(m - 1, -1, -1):
-        v = a[i][m] - sum(a[i][c] * w[c] for c in range(i + 1, m))
-        w[i] = v / a[i][i] if abs(a[i][i]) > 1e-300 else 0.0
-    return w
+        z = [1.0] + [sym[n - 1 - m] if n - 1 - m >= 0 else 0.0 for m in range(taps)]
+        seg = v[n * T:(n + 1) * T]
+        used += 1
+        for i in range(size):
+            zi = z[i]
+            if zi:
+                acc[i] = [p + zi * x for p, x in zip(acc[i], seg)]
+                for j in range(size):
+                    q[i][j] += zi * z[j]
+    if used < size:
+        return None
+    low = cholesky(q)
+    if low is None:
+        return None
+    g = [0.0] * (taps * T)
+    for phase in range(T):
+        x = chol_solve(low, [acc[i][phase] for i in range(size)])
+        for m in range(taps):
+            g[m * T + phase] = x[1 + m]
+    return g
 
 
-def ar_filter(v, ar):
-    out = [0.0] * len(v)
-    for t in range(len(v)):
-        acc = v[t]
-        for i in range(1, min(AP, t) + 1):
-            acc += ar[i - 1] * out[t - i]
-        if acc != acc or abs(acc) > 1e15:
-            return None
-        out[t] = acc
-    return out
+def gram(g, count, t_end):
+    length = len(g)
+    taps = length // T
+    size = count + 1
+    m = [[0.0] * size for _ in range(size)]
+    m[0][0] = float(t_end - T)
+    pg = list(accumulate(g, initial=0.0))
+    lags = [list(accumulate(map(mul, g, g[d * T:]), initial=0.0)) for d in range(taps)]
+    for k in range(count):
+        span = min(length, t_end - T - k * T)
+        m[0][1 + k] = m[1 + k][0] = pg[span]
+        for d in range(taps):
+            other = k + d
+            if other >= count:
+                break
+            value = lags[d][max(0, min(length - d * T, t_end - T - other * T))]
+            m[1 + k][1 + other] = m[1 + other][1 + k] = value
+    return cholesky(m)
 
 
-def arx_fit(x, y, t1):
-    t0 = max(AP, AQ)
-    if t1 - t0 < 3 * (AP + AQ):
-        return []
-    yl, xl, ol = list(y)[:t1], list(x)[:t1], [1.0] * t1
-    y0 = yl[0]
-    yl = [v - y0 for v in yl]
-    res = []
-    yf, xf, of = yl, xl, ol
-    for _ in range(4):
-        cols = [yf[t0 - i:t1 - i] for i in range(1, AP + 1)]
-        cols += [xf[t0 - j:t1 - j] for j in range(AQ)]
-        cols.append(of[t0:t1])
-        tgt = yf[t0:t1]
-        if np is not None:
-            cols = [np.array(c, float) for c in cols]
-            tgt = np.array(tgt, float)
-        try:
-            w = [float(v) for v in lstsq(cols, tgt)]
-        except Exception:
+def project(g, low, v, count, t_end):
+    length = len(g)
+    body = v[T:t_end]
+    r = [sum(body)]
+    for k in range(count):
+        start = T + k * T
+        span = min(length, t_end - start)
+        r.append(sumprod(v[start:start + span], g[:span]))
+    theta = chol_solve(low, r)
+    return {'theta': theta, 'amps': theta[1:], 'rss': sumprod(body, body) - sumprod(theta, r)}
+
+
+def detect(g, v, count, t_end):
+    low = gram(g, count, t_end)
+    return None if low is None else project(g, low, v, count, t_end)
+
+
+def pilot_gain(amps):
+    scores = [amps[k] * PILOT[k] for k in range(NP)]
+    alpha = sum(scores) / NP
+    return alpha, (min(scores) / alpha if alpha > 0.0 else -1.0)
+
+
+def adopt(sym, known, amps, count):
+    alpha, _ = pilot_gain(amps)
+    changed = False
+    for k in range(NP, count):
+        value = 1.0 if amps[k] > 0.0 else -1.0
+        sure = alpha > 0.0 and abs(amps[k]) > 0.35 * alpha
+        if value != sym[k] or sure != known[k]:
+            changed = True
+        sym[k], known[k] = value, sure
+    return changed
+
+
+def refine(v, g, result, rounds):
+    sym = PILOT + [0.0] * (NS - NP)
+    known = [True] * NP + [False] * (NS - NP)
+    for _ in range(rounds):
+        if not adopt(sym, known, result['amps'], NS):
             break
-        ar, bq = w[:AP], w[AP:AP + AQ]
-        h = ar_filter(bq + [0.0] * (N - AQ), ar)
-        if h is None:
+        candidate = estimate(v, sym, known, NS, TAPS)
+        if candidate is None:
             break
-        head = max(abs(v) for v in h[:N // 2])
-        if head == 0.0 or max(abs(v) for v in h[N // 2:]) > 3.0 * head:
+        outcome = detect(candidate, v, NS, N)
+        if outcome is None or outcome['rss'] >= result['rss']:
             break
-        res.append(np.array(h) if np is not None else h)
-        yf, xf, of = ar_filter(yl, ar), ar_filter(xl, ar), ar_filter(ol, ar)
-        if yf is None or xf is None or of is None:
-            break
-    return res[:1] + res[-1:] if len(res) > 1 else res
+        g, result = candidate, outcome
+    return g, result
 
 
-def fir_fit(x, y):
-    cols = [np.ones(N)]
-    if H:
-        cols += [H['step'], np.convolve(H['ht'], x)[:N]]
-    nb = len(cols)
-    a = np.column_stack(cols + [shift(x, d) for d in range(LF)])
-    m = a.T @ a
-    d = np.diag(m).copy()
-    lam = np.zeros(len(d))
-    lam[:nb] = 1e-9 * d[:nb]
-    lam[nb:] = 1e-3 * d[nb:].mean()
-    w = np.linalg.solve(m + np.diag(lam), a.T @ y)
-    heff = np.zeros(N)
-    heff[:LF] = w[nb:]
-    if H:
-        heff = heff + w[nb - 1] * H['ht']
-    return heff
+def full_decode(v):
+    sym = PILOT + [0.0] * (NS - NP)
+    known = [True] * NP + [False] * (NS - NP)
+    g = None
+    for have, taps, count in STAGES:
+        candidate = estimate(v, sym, known, have, taps)
+        if candidate is not None:
+            g = candidate
+        if g is None:
+            return None, None
+        result = detect(g, v, count, min(N, (count + 1) * T) if count < NS else N)
+        if result is None:
+            return None, None
+        adopt(sym, known, result['amps'], count)
+    return refine(v, g, result, 3)
 
 
-def build_x(s, pat):
-    x = [0.0] * N
-    for k, sk in enumerate(s):
-        if sk:
-            for i, p in enumerate(pat):
-                x[k * T + i] = sk * p
-    return np.array(x) if np is not None else x
+def predict(g, theta):
+    out = [theta[0]] * (N + len(g))
+    for k, amp in enumerate(theta[1:]):
+        start = T + k * T
+        out[start:start + len(g)] = [p + amp * x for p, x in zip(out[start:start + len(g)], g)]
+    return out[:N]
 
 
-def read_bits(c):
-    if KNOWN_LEN is not None:
-        ln = KNOWN_LEN
-    else:
-        ln = 0
-        for i in range(NL):
-            ln = ln * 2 + (1 if c[NP + i] > 0 else 0)
-        ln = min(MAXB, ln + 1)
-    return ''.join('1' if c[NP + NL + i] > 0 else '0' for i in range(ln))
+def clean(v, g, theta):
+    fit = predict(g, theta)
+    res = [x - y for x, y in zip(v[T:], fit[T:])]
+    limit = max(6.0 * 1.4826 * sorted(map(abs, res))[len(res) // 2], 2.0)
+    bad = [T + i for i, x in enumerate(res) if abs(x) > limit]
+    if not bad or len(bad) > N // 4:
+        return False
+    for i in bad:
+        for j in range(max(T, i - 2), min(N, i + 3)):
+            v[j] = fit[j]
+    return True
 
 
-def decode(y):
-    y = [float(v) for v in y[:N]] + [0.0] * max(0, N - len(y))
-    pat = PATS[H['cand']] if H else PATS[0]
-    if np is not None:
-        y = np.array(y)
+def acceptable(result):
+    return pilot_gain(result['amps'])[1] > 0.3 and result['rss'] / N <= 4.0 * MODEL['noise'] + 1.0
+
+
+def read_message(amps):
+    alpha, quality = pilot_gain(amps)
+    if alpha <= 0.0:
+        alpha = sum(map(abs, amps)) / len(amps) or 1.0
+    soft = [max(-1.5, min(1.5, a / alpha)) for a in amps]
+    field = [soft[NP + i] * SCR_F[i] for i in range(NF)]
+    data = [soft[NP + NF + j] * SCR_B[j] for j in range(NB)]
     best = None
+    for length in range(1, NB + 1):
+        sums = [sum(data[i::length]) for i in range(length)]
+        score = sum(map(abs, sums))
+        score += sum((f + past) * c for f, past, c in zip(field, FIELD_ACC, CODES[length - 1]))
+        if best is None or score > best[0]:
+            best = (score, sums)
+    if quality > 0.5:
+        for i in range(NF):
+            FIELD_ACC[i] = max(-20.0, min(20.0, FIELD_ACC[i] + field[i]))
+    return ''.join('1' if s > 0.0 else '0' for s in best[1])
 
-    def consider(heff, use_step=True):
-        nonlocal best
-        if heff is None:
-            return
+
+def decode(values):
+    global MODEL
+    if not values:
+        return '0'
+    raw = [float(x) for x in values[:N]] + [float(values[-1])] * (N - len(values))
+    filtered = apply_fir(raw, SHAPER, raw[0])
+    v = [x - raw[0] for x in filtered]
+    g = result = None
+    if MODEL is not None:
+        result = project(MODEL['g'], MODEL['low'], v, NS, N)
+        if not acceptable(result) and clean(v, MODEL['g'], result['theta']):
+            result = project(MODEL['g'], MODEL['low'], v, NS, N)
+        if acceptable(result):
+            g, result = refine(v, MODEL['g'], result, 1)
+        else:
+            result = None
+    if result is None:
+        g, result = full_decode(v)
+        if g is None:
+            return '0'
+    if clean(v, g, result['theta']):
+        again = detect(g, v, NS, N)
+        if again is not None:
+            g, result = refine(v, g, again, 2)
+    if pilot_gain(result['amps'])[1] > 0.3:
+        if MODEL is None or g is not MODEL['g']:
+            MODEL = {'g': g, 'low': gram(g, NS, N), 'noise': result['rss'] / N}
+    else:
+        MODEL = None
+    return read_message(result['amps'])
+
+
+def read_integers(line):
+    out = []
+    for token in line.split():
         try:
-            res, c = sym_ls(heff, y, pat, use_step)
-        except Exception:
-            return
-        if res == res and (best is None or res < best[0]):
-            best = (res, c)
-
-    if H:
-        consider(H['ht'])
-    pil = [PILOT[k] if k < NP else 0.0 for k in range(NS)]
-    for hm in arx_fit(build_x(pil, pat), y, NP * T):
-        consider(hm)
-    if best is None:
-        res, c = sym_ls([1.0], y, pat, False)
-        if sum(p * q for p, q in zip(PILOT, c)) < 0:
-            c = [-v for v in c]
-        best = (res, c)
-    prev = None
-    for _ in range(3):
-        bits = read_bits(best[1])
-        if bits == prev:
-            break
-        prev = bits
-        x = build_x(symbols_for(bits), pat)
-        for hm in arx_fit(x, y, N):
-            consider(hm)
-        if np is not None:
+            out.append(int(token))
+        except ValueError:
             try:
-                consider(fir_fit(x, y))
-            except Exception:
+                out.append(int(float(token)))
+            except ValueError:
                 pass
-    return read_bits(best[1])
+    return out
 
 
 def main():
-    data = sys.stdin
+    stream = sys.stdin
     out = sys.stdout
 
     def next_line():
         while True:
-            line = data.readline()
+            line = stream.readline()
             if not line:
                 return None
             if line.strip():
@@ -378,18 +467,11 @@ def main():
         if mode == '1':
             out.write(' '.join(map(str, encode(payload))) + '\n')
             out.flush()
+        elif mode == '2':
+            out.write(decode(read_integers(payload)) + '\n')
+            out.flush()
         else:
-            vals = []
-            for tok in payload.split():
-                try:
-                    vals.append(int(float(tok)))
-                except ValueError:
-                    pass
-            if mode == '3':
-                baseline(vals)
-            else:
-                out.write(decode(vals) + '\n')
-                out.flush()
+            analyse_baseline(read_integers(payload))
 
 
 if __name__ == '__main__':
